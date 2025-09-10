@@ -1,0 +1,7 @@
+auth:
+  username: admin
+  password: admin
+  database: tasksdb
+primary:
+  persistence:
+    enabled: false
