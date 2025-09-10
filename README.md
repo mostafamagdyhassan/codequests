@@ -367,3 +367,501 @@ The exact Helm values may vary with chart versions. The scripts will pass cluste
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+5555555555555555555555555555555555555555555555555555555555555555555555555555555555555555
+
+
+1) Access control (network + service → resource scoping)
+
+Enforced by
+
+Kubernetes NetworkPolicy to restrict Pod→Pod / Pod→DB communications.
+
+AWS Security Groups limiting inbound to app subnets / ALB only.
+
+Namespaces for multi-tenant separation (app namespace).
+
+Least-privileged SG rules and private subnets for DB.
+
+Example manifests / snippets
+
+Kubernetes NetworkPolicy that allows only app namespace to talk to Postgres (we showed this earlier). Repeated here for convenience:
+
+# templates/postgres-netpol.yaml (or standalone manifest)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-allow-app
+  namespace: default    # postgres namespace
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postgresql
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: app
+      ports:
+        - protocol: TCP
+          port: 5432
+
+
+AWS Security Group example (Terraform snippet):
+
+resource "aws_security_group" "alb_sg" {
+  name        = "${var.env}-alb-sg"
+  vpc_id      = module.vpc.vpc_id
+  description = "Allow HTTP/HTTPS from internet to ALB"
+  ingress = [
+    { from_port = 80,  to_port = 80,  protocol = "tcp", cidr_blocks = ["0.0.0.0/0"] },
+    { from_port = 443, to_port = 443, protocol = "tcp", cidr_blocks = ["0.0.0.0/0"] },
+  ]
+  egress = [{ from_port = 0, to_port = 0, protocol = "-1", cidr_blocks = ["0.0.0.0/0"] }]
+}
+
+
+Validation checks / tests
+
+A. Validate NetworkPolicy denies traffic from other namespaces:
+
+# create a debug pod in another namespace (not app), try to connect to postgres
+kubectl run debug --image=appropriate/curl -n other-ns -- sleep 3600
+kubectl exec -n other-ns $(kubectl get pod -n other-ns -l run=debug -o name | cut -d/ -f2) -- \
+  sh -c "wget -qO- http://postgres-postgresql.default.svc.cluster.local:5432" || echo "connection blocked"
+# expected: connection blocked (or tcp timeout)
+
+
+B. Validate SGs in AWS are correct (Terraform output / AWS CLI check):
+
+aws ec2 describe-security-groups --filters "Name=group-name,Values=${ENV}-alb-sg" --profile ${PROFILE}
+
+
+Add these checks to an automation script scripts/security-checks.sh (see below).
+
+2) DDoS protection & WAF
+
+Enforced by
+
+AWS WAF attached to the ALB (application load balancer).
+
+AWS Shield (Standard is automatic; Shield Advanced optional).
+
+Rate limiting / IP blocking rules in WAF (managed rule groups + custom rules).
+
+ALB idle/timeouts tuned to mitigate slow-Loris style attacks.
+
+Example Terraform (WAF v2) snippet
+
+resource "aws_wafv2_web_acl" "app_waf" {
+  name        = "${var.env}-web-acl"
+  scope       = "REGIONAL"
+  default_action { allow {} }
+  visibility_config {
+    cloudwatch_metrics_enabled = true
+    metric_name                = "${var.env}-waf"
+    sampled_requests_enabled   = true
+  }
+
+  rule {
+    name     = "RateLimit100"
+    priority = 1
+    action { block {} }
+    statement {
+      rate_based_statement {
+        limit = 2000  # requests per 5 minutes per IP (example)
+        aggregate_key_type = "IP"
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "RateLimit100"
+      sampled_requests_enabled   = true
+    }
+  }
+  # add managed rule groups (e.g., AWSManagedRulesCommonRuleSet) as needed
+}
+
+
+Associate with ALB (Terraform uses aws_lb_listener + aws_wafv2_web_acl_association).
+
+Validation checks / tests (safe, non-destructive)
+
+Verify WAF exists and rules are active:
+
+aws wafv2 get-web-acl --name ${ENV}-web-acl --scope REGIONAL --region ${REGION} --profile ${PROFILE}
+
+
+Simulated malicious request check (safe test): send a known SQL-injection-like payload to an endpoint protected by ALB + WAF and verify ALB returns 403 or WAF logs the request.
+
+# Do NOT run high volume requests
+curl -i -X GET "https://<ALB-DNS>/listTasks?param=' or 1=1 --" -H "User-Agent: scanner-test"
+# Expected: 403 or blocked page if WAF rule matches.
+
+
+Check WAF metrics / logs (CloudWatch) for blocked requests:
+
+aws cloudwatch get-metric-statistics --namespace "AWS/WAFV2" --metric-name "BlockedRequests" --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ) --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) --period 60 --statistics Sum --region ${REGION} --profile ${PROFILE}
+
+
+Notes / trade-offs
+
+AWS Shield Advanced is paid — document costs before enabling.
+
+Do not run DDoS tests that flood external networks; use rate-limited synthetic tests.
+
+3) Data encryption — at rest & in transit
+
+Enforced by
+
+At rest
+
+EBS volumes (worker node storage and dynamic PVs) encrypted with customer-managed KMS key (CMK).
+
+EKS Secrets encryption at rest (encryptionConfig using KMS) for etcd (EKS supports encryptionConfig via API or eksctl/module).
+
+S3 buckets and RDS/managed databases encrypted with KMS.
+
+In transit
+
+TLS termination at ALB (cert from ACM). Internal pod→pod traffic uses mTLS optionally (not enabled by default); at minimum we use TLS for client→ALB and ALB→ingress/backend (HTTPS).
+
+Enforce readOnlyRootFilesystem and avoid plaintext secrets in env.
+
+Example Terraform snippet (KMS + EBS default encryption)
+
+resource "aws_kms_key" "eks" {
+  description             = "KMS key for EKS secrets & EBS"
+  deletion_window_in_days = 30
+}
+
+# EBS encryption by default
+resource "aws_ebs_encryption_by_default" "default" {
+  enabled = true
+}
+
+
+EKS encryption_config example (module or eksctl): create a KMS key and add encryption for secrets in encryptionConfig. See module docs for exact usage.
+
+ACM cert + ALB listener (Terraform):
+
+resource "aws_acm_certificate" "alb_cert" {
+  domain_name = var.domain_name
+  validation_method = "DNS"
+  # validation records omitted
+}
+
+resource "aws_lb_listener" "https" {
+  load_balancer_arn = aws_lb.app.arn
+  port              = "443"
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-2016-08"
+  certificate_arn   = aws_acm_certificate.alb_cert.arn
+  default_action {
+    type = "forward"
+    target_group_arn = aws_lb_target_group.app.arn
+  }
+}
+
+
+Validation checks / tests
+
+A. Validate TLS on public endpoint:
+
+openssl s_client -connect <ALB-DNS>:443 -servername <your-hostname> </dev/null 2>/dev/null | \
+  sed -n '/-----BEGIN CERTIFICATE-----/,/-END CERTIFICATE-----/p'
+# or check negotiated cipher
+openssl s_client -connect <ALB-DNS>:443 -servername <your-hostname> 2>/dev/null | grep "Cipher"
+
+
+B. Validate EBS encryption (list volumes & check Encrypted flag):
+
+aws ec2 describe-volumes --filters "Name=tag:Name,Values=*eks*" --query 'Volumes[*].{ID:VolumeId,Encrypted:Encrypted}' --profile ${PROFILE}
+
+
+C. Validate Kubernetes secrets encryption at rest (if configured):
+
+Confirm EKS cluster has encryption config enabled (Terraform output / AWS console).
+
+Show that etcd data uses KMS (this is cloud-side verification). Alternatively, test access: kubectl get secrets -n kube-system -o yaml — note secrets are base64 encoded; the verification that they are KMS-encrypted must come from cluster config (Terraform output).
+
+Add an automated check scripts/check-encryption.sh:
+
+#!/usr/bin/env bash
+set -euo pipefail
+# Check TLS
+ALB_DNS="$1"
+echo "Checking TLS on ${ALB_DNS}"
+openssl s_client -connect "${ALB_DNS}:443" -servername "${ALB_DNS}" </dev/null 2>/dev/null | grep "Cipher" || { echo "TLS test failed"; exit 2; }
+# Check EBS volumes encryption
+PROFILE="${AWS_PROFILE:-default}"
+if ! aws ec2 describe-volumes --filters "Name=tag:Name,Values=*eks*" --profile "${PROFILE}" --query 'Volumes[].Encrypted' | grep true ; then
+  echo "At least one EBS volume not encrypted or cannot be verified"; exit 3
+fi
+echo "Encryption checks passed"
+
+4) Secrets management
+
+Enforced by
+
+Use AWS Secrets Manager or AWS SSM Parameter Store for database credentials and sensitive config. Application uses IRSA + kubernetes-external-secrets (or external-secrets Helm chart) to fetch secrets into Kubernetes securely.
+
+Kubernetes Secrets are still used but stored encrypted at rest (see previous section).
+
+Avoid environment variables with plaintext secrets in Helm values — use references.
+
+Example (Kubernetes External Secrets)
+
+Helm install (example):
+
+helm repo add external-secrets https://external-secrets.github.io/kubernetes-external-secrets/
+helm upgrade --install external-secrets external-secrets/kubernetes-external-secrets --namespace kube-system
+
+
+A sample ExternalSecret resource:
+
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: db-credentials
+  namespace: app
+spec:
+  refreshInterval: "1h"
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: SecretStore
+  target:
+    name: db-credentials
+    creationPolicy: Owner
+  data:
+    - secretKey: username
+      remoteRef:
+        key: prod/tasksdb/username
+    - secretKey: password
+      remoteRef:
+        key: prod/tasksdb/password
+
+
+Validation checks / tests
+
+A. Verify SecretStore is reachable & ExternalSecret created secret:
+
+kubectl get externalsecret -n app db-credentials -o yaml
+kubectl get secret db-credentials -n app -o jsonpath='{.data.username}' | base64 --decode
+# This will print username (safe if you have permissions). The test verifies the secret was synced.
+
+
+B. Validate Secrets Manager entry exists:
+
+aws secretsmanager get-secret-value --secret-id prod/tasksdb/username --profile ${PROFILE}
+
+
+C. Automated check scripts/check-secrets.sh:
+
+#!/usr/bin/env bash
+set -euo pipefail
+kubectl get secret db-credentials -n app >/dev/null || { echo "db-credentials not found"; exit 1; }
+echo "Kubernetes secret exists"
+aws secretsmanager get-secret-value --secret-id prod/tasksdb/username --profile ${AWS_PROFILE} >/dev/null || { echo "SecretsManager secret missing"; exit 2; }
+echo "AWS SecretsManager check OK"
+
+5) Role-Based Access Control (RBAC)
+
+Enforced by
+
+Kubernetes Roles / RoleBindings scoped to namespaces.
+
+Use least-privilege Roles for CI/CD service accounts and controllers.
+
+Use IRSA for AWS permissions (map Kubernetes service accounts to IAM roles).
+
+Example Kubernetes Role + RoleBinding (backend read-only for tasks)
+
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  namespace: app
+  name: tasks-reader
+rules:
+  - apiGroups: [""]
+    resources: ["pods","services","endpoints"]
+    verbs: ["get","list","watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bind-tasks-reader
+  namespace: app
+subjects:
+  - kind: ServiceAccount
+    name: backend-sa
+    namespace: app
+roleRef:
+  kind: Role
+  name: tasks-reader
+  apiGroup: rbac.authorization.k8s.io
+
+
+Validation checks / tests
+
+A. Use kubectl auth can-i to test permissions:
+
+# Using a kubeconfig bound to the service account (or impersonate)
+kubectl auth can-i get pods --as=system:serviceaccount:app:backend-sa -n app
+# Expected: "yes"
+kubectl auth can-i create secrets --as=system:serviceaccount:app:backend-sa -n app
+# Expected: "no"
+
+
+B. Automated RBAC check scripts/check-rbac.sh:
+
+#!/usr/bin/env bash
+set -euo pipefail
+if kubectl auth can-i get pods --as=system:serviceaccount:app:backend-sa -n app | grep -q yes; then
+  echo "backend-sa has get pods - OK"
+else
+  echo "backend-sa missing get pods"
+  exit 1
+fi
+if kubectl auth can-i create secrets --as=system:serviceaccount:app:backend-sa -n app | grep -q no; then
+  echo "backend-sa does not create secrets - OK"
+else
+  echo "backend-sa can create secrets (too permissive)"
+  exit 2
+fi
+
+6) Automated security checks & tests (one script to run the checks)
+
+Place the following script as scripts/security-checks.sh and make executable. It calls the smaller checks above and exits non-zero on failures so CI can pick it up.
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ALB_DNS="${ALB_DNS:-your-alb-dns.example.com}"
+PROFILE="${AWS_PROFILE:-default}"
+
+echo "Running network policy test..."
+kubectl run test-client --image=appropriate/curl -n other-ns -- sleep 3600 || true
+sleep 1
+kubectl exec -n other-ns $(kubectl get pod -n other-ns -l run=test-client -o name | cut -d/ -f2) -- \
+  sh -c "nc -z -w3 postgres-postgresql.default.svc.cluster.local 5432" && { echo "ERROR: external-ns connected to postgres (should be blocked)"; exit 1; } || echo "NetworkPolicy OK"
+
+echo "Running WAF/TLS/EBS/Secrets/RBAC checks..."
+# TLS
+openssl s_client -connect "${ALB_DNS}:443" -servername "${ALB_DNS}" </dev/null 2>/dev/null | grep "Cipher" || { echo "TLS FAILED"; exit 2; }
+
+# EBS encryption quick check
+if ! aws ec2 describe-volumes --filters "Name=tag:Name,Values=*eks*" --profile "${PROFILE}" --query 'Volumes[*].Encrypted' | grep true ; then
+  echo "EBS encryption missing"
+  exit 3
+fi
+
+# Secrets
+kubectl get secret db-credentials -n app >/dev/null || { echo "External secret not synced"; exit 4; }
+
+# RBAC
+if ! kubectl auth can-i get pods --as=system:serviceaccount:app:backend-sa -n app | grep -q yes; then
+  echo "RBAC misconfigured for backend-sa"
+  exit 5
+fi
+
+echo "All security checks passed"
+
+
+Add this to CI: Run scripts/security-checks.sh after deploy step in CI (e.g., GitHub Actions) to automatically validate the main security posture.
+
+7) Notes & trade-offs / limitations
+
+WAF/Shield: WAF rules and Shield Advanced cost money. We provide Terraform snippets, but enabling Shield Advanced is optional (and should be a controlled decision).
+
+Secrets: Kubernetes Secrets are base64-encoded — not encrypted by default unless kube-apiserver encryptionConfig is enabled. Use KMS-backed encryption for etcd or use ExternalSecrets to keep secrets in AWS Secrets Manager.
+
+Encryption verification: Some checks (e.g., etcd server-side encryption) require checking cluster configuration / AWS console or Terraform outputs — not just in-cluster commands.
+
+NetworkPolicy enforcement: NetworkPolicy only works if your CNI supports it (most do: Calico, Cilium). AWS VPC CNI historically requires an additional controller or using security groups for Pod networking — verify on your cluster.
+
+RBAC tests: kubectl auth can-i --as is a practical, safe way to validate permissions. Impersonation requires cluster admin privileges to test.
+
+No DDoS testing included: We do not issue DDoS or high-volume traffic to external endpoints. Use load tests responsibly and in isolated environments.
+
+8) Where to add these files in the repo
+
+scripts/:
+
+security-checks.sh (above)
+
+check-encryption.sh
+
+check-secrets.sh
+
+check-rbac.sh
+
+terraform/:
+
+modules/waf/ (WAF resources snippet + association)
+
+KMS key and parameters in modules/security/
+
+helm-chart/templates/:
+
+networkpolicy-postgres.yaml
+
+rbac.yaml for service accounts and roles
+
+externalsecret.yaml (templated ExternalSecret)
+
+9) Example quick checklist for operators (copy to README)
+
+kubectl get ns → app present.
+
+kubectl get netpol -A → Postgres NetPol exists.
+
+kubectl auth can-i ... --as=system:serviceaccount:app:backend-sa → expected responses.
+
+aws wafv2 get-web-acl --name <web-acl> → rules present.
+
+openssl s_client -connect <ALB>:443 → TLS negotiates.
+
+aws ec2 describe-volumes --filters 'Name=tag:Name,Values=*eks*' → Encrypted true.
+
+kubectl get secret db-credentials -n app → exists (synced from AWS Secrets Manager).
+
+Run scripts/security-checks.sh → all green.
+
+If you want, I can next:
+
+Add the exact templated files (ExternalSecret, NetworkPolicy, RBAC, WAF Terraform module) into the repo layout and push the ready-to-copy contents here.
+
+Convert the checks into proper GitHub Actions workflow steps so they run automatically after deploy.
+
+Which do you want me to produce next?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
