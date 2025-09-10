@@ -26,6 +26,13 @@ spec:
               value: admin
             - name: DB_PASS
               value: admin
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
 ---
 apiVersion: v1
 kind: Service
