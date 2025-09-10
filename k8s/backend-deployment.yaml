@@ -12,6 +12,11 @@ spec:
       labels:
         app: backend
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000   # non-root UID
+        runAsGroup: 1000  # non-root GID
+        fsGroup: 1000
       containers:
         - name: backend
           image: your-dockerhub-username/backend:latest
@@ -26,6 +31,11 @@ spec:
               value: admin
             - name: DB_PASS
               value: admin
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
           resources:
             requests:
               cpu: "200m"
