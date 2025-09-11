@@ -1052,6 +1052,58 @@ Compliance: Encryption at rest/in transit, RBAC, PSA, NetworkPolicies, region-aw
 FinOps: Kubecost for cost allocation, right-sizing with HPA, separate dev/prod resources, AWS Budgets for forecasting.
 
 
+                ┌───────────────────────────┐
+                │         Frontend          │
+                │ (NGINX serving static app)│
+                └───────────┬───────────────┘
+                            │
+                            ▼
+                ┌───────────────────────────┐
+                │         Backend           │
+                │   Flask API + OTEL +      │
+                │   Prometheus metrics      │
+                └───────────┬───────────────┘
+                            │
+                            ▼
+                ┌───────────────────────────┐
+                │        Postgres DB        │
+                │  + postgres_exporter      │
+                └───────────────────────────┘
+
+
+   ┌─────────────────────────────────────────────────────────┐
+   │                  Observability Stack                    │
+   │  Prometheus <──scrapes── backend, exporter               │
+   │  Alertmanager → email alerts                             │
+   │  Grafana ← dashboards ← Prometheus + Loki + Jaeger       │
+   │  Loki+Promtail ← logs (app, db, infra)                   │
+   │  Jaeger ← traces from OTEL Collector                     │
+   └─────────────────────────────────────────────────────────┘
+
+
+   ┌─────────────────────────────────────────────────────────┐
+   │                   Security Controls                     │
+   │  - PSA (non-root)  - RBAC  - NetworkPolicies             │
+   │  - TLS ingress     - Secrets mgmt (Vault/K8s)            │
+   │  - Trivy / pip-audit / Falco                             │
+   └─────────────────────────────────────────────────────────┘
+
+
+   ┌─────────────────────────────────────────────────────────┐
+   │                 Infrastructure Layer                    │
+   │  - Terraform → VPC, EKS, SGs, IAM, storage              │
+   │  - Dev = local (Minikube/MicroK8s)                      │
+   │  - Prod = AWS EKS (HA, multi-AZ)                        │
+   └─────────────────────────────────────────────────────────┘
+
+
+   ┌─────────────────────────────────────────────────────────┐
+   │                  FinOps (Cost Mgmt)                     │
+   │  - Kubecost → per-namespace cost                        │
+   │  - AWS Budgets → prod cost alerts                       │
+   │  - Right-sizing with HPA, cleaning idle resources        │
+   └─────────────────────────────────────────────────────────┘
+
 
 
 
