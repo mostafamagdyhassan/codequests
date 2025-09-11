@@ -1,0 +1,54 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "title": "Active Connections",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "pg_stat_activity_count{datname=\"tasksdb\"}",
+          "legendFormat": "{{datname}}"
+        }
+      ],
+      "id": 1
+    },
+    {
+      "title": "Transactions per Second",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "rate(pg_stat_xact_commit{datname=\"tasksdb\"}[5m]) + rate(pg_stat_xact_rollback{datname=\"tasksdb\"}[5m])",
+          "legendFormat": "{{datname}}"
+        }
+      ],
+      "id": 2
+    },
+    {
+      "title": "Database Size (MB)",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "pg_database_size_bytes{datname=\"tasksdb\"} / 1024 / 1024",
+          "legendFormat": "{{datname}}"
+        }
+      ],
+      "id": 3
+    },
+    {
+      "title": "Cache Hit Ratio",
+      "type": "gauge",
+      "targets": [
+        {
+          "expr": "rate(pg_stat_db_blks_hit{datname=\"tasksdb\"}[5m]) / (rate(pg_stat_db_blks_hit{datname=\"tasksdb\"}[5m]) + rate(pg_stat_db_blks_read{datname=\"tasksdb\"}[5m]))",
+          "legendFormat": "{{datname}}"
+        }
+      ],
+      "id": 4
+    }
+  ],
+  "title": "Postgres DB Metrics",
+  "uid": "postgres-metrics",
+  "version": 1
+}
