@@ -43,15 +43,17 @@ services:
     ports:
       - "9090:9090"
 
-  grafana:
+   grafana:
     image: grafana/grafana
     container_name: grafana
     ports:
       - "3000:3000"
     volumes:
       - grafana_data:/var/lib/grafana
-    depends_on:
-      - prometheus
+      - ./monitoring/dashboards:/var/lib/grafana/dashboards
+    environment:
+      - GF_PROVISIONING_PATH=/etc/grafana/provisioning
+
 
   node-exporter:
     image: prom/node-exporter
