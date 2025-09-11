@@ -1115,3 +1115,72 @@ FinOps: Kubecost for cost allocation, right-sizing with HPA, separate dev/prod r
 
 
 
+k8888888888888888888888888888888888888888888888888888888
+
+
+
+
+
+How to apply everything (recommended order)
+
+Create namespaces:
+
+kubectl apply -f kubernetes/namespaces/00-ns-app.yaml
+kubectl apply -f kubernetes/namespaces/00-ns-monitoring.yaml
+
+
+Create secrets:
+
+kubectl apply -f kubernetes/secrets/secret-db.yaml
+kubectl apply -f kubernetes/secrets/secret-alerts.yaml
+
+
+Deploy Postgres (so DB exists before backend):
+
+kubectl apply -f kubernetes/deployments/postgres-deployment.yaml
+kubectl apply -f kubernetes/services/postgres-svc.yaml
+
+
+NetworkPolicy default-deny then specific allow:
+
+kubectl apply -f kubernetes/networkpolicies/default-deny-app.yaml
+kubectl apply -f kubernetes/networkpolicies/postgres-netpol.yaml
+
+
+Deploy backend & frontend + services:
+
+kubectl apply -f kubernetes/deployments/backend-deployment.yaml
+kubectl apply -f kubernetes/services/backend-svc.yaml
+kubectl apply -f kubernetes/deployments/frontend-deployment.yaml
+kubectl apply -f kubernetes/services/frontend-svc.yaml
+
+
+Deploy monitoring & tracing (monitoring namespace):
+
+kubectl apply -f kubernetes/deployments/prometheus-deployment.yaml
+kubectl apply -f kubernetes/deployments/grafana-deployment.yaml
+kubectl apply -f kubernetes/deployments/loki-deployment.yaml
+kubectl apply -f kubernetes/deployments/promtail-daemonset.yaml
+kubectl apply -f kubernetes/deployments/otel-collector-deployment.yaml
+kubectl apply -f kubernetes/deployments/jaeger-deployment.yaml
+
+
+Apply HPA:
+
+kubectl apply -f kubernetes/hpa/backend-hpa.yaml
+
+
+Apply Ingress (ensure ingress controller is installed):
+
+kubectl apply -f kubernetes/ingress/ingress.yaml
+
+Final notes & tips
+
+Metrics-server is required for HPA to work: install it if missing:
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+For Prometheus, Grafana, Loki, Jaeger in production use their official Helm charts (they handle persistent storage, RBAC, service accounts, and scalability).
+
+Adjust resource requests/limits and replica counts before deploying to production.
+
+If your cluster blocks hostPath mounts (promtail), adjust to use a DaemonSet with a Fluent Bit or a cluster logging solution.
