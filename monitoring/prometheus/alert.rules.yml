@@ -1,0 +1,41 @@
+groups:
+  - name: application-alerts
+    interval: 30s
+    rules:
+      # ------------------------------
+      # High CPU usage (>80% for 5 min)
+      # ------------------------------
+      - alert: HighCPUUsage
+        expr: (sum(rate(container_cpu_usage_seconds_total{image!=""}[5m])) by (pod)) 
+              / sum(kube_pod_container_resource_limits_cpu_cores) by (pod) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage detected for pod {{ $labels.pod }}"
+          description: "Pod {{ $labels.pod }} CPU usage >80% for more than 5 minutes."
+
+      # ------------------------------
+      # Pod CrashLoopBackOff / Restarts
+      # ------------------------------
+      - alert: PodCrashLooping
+        expr: increase(kube_pod_container_status_restarts_total[5m]) > 3
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pod {{ $labels.pod }} is crash looping"
+          description: "Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} restarted more than 3 times in 5 minutes."
+
+      # ------------------------------
+      # Postgres down/unavailable
+      # (requires postgres_exporter or blackbox_exporter probing)
+      # ------------------------------
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Postgres database is down"
+          description: "Postgres exporter reports database is not reachable."
