@@ -1,38 +1,39 @@
-version: "3.9"
+version: "3.8"
 
 services:
-  postgres:
-    image: postgres:15
-    container_name: postgres
+  db:
+    build: ./postgres
+    container_name: postgres_db
     environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: admin
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypassword
       POSTGRES_DB: tasksdb
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
 
   backend:
     build: ./backend
-    container_name: backend
-    depends_on:
-      - postgres
+    container_name: backend_app
     environment:
-      DB_HOST: postgres
+      DB_HOST: db
+      DB_PORT: 5432
       DB_NAME: tasksdb
-      DB_USER: admin
-      DB_PASS: admin
+      DB_USER: myuser
+      DB_PASSWORD: mypassword
+    depends_on:
+      - db
     ports:
       - "8000:8000"
 
   frontend:
     build: ./frontend
-    container_name: frontend
-    depends_on:
-      - backend
+    container_name: frontend_app
     ports:
       - "8080:80"
+    depends_on:
+      - backend
 
 volumes:
   postgres_data:
