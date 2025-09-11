@@ -4,6 +4,7 @@ global:
 
 rule_files:
   - "alerts.yml"   # Load alerting rules
+  - "alert.rules.yml"
 
 scrape_configs:
   - job_name: 'backend'
