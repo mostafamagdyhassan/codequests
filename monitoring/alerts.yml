@@ -1,0 +1,18 @@
+groups:
+  - name: uptime-latency
+    rules:
+      - alert: HighLatency
+        expr: histogram_quantile(0.9, rate(request_latency_seconds_bucket[5m])) > 2
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          description: "90th percentile latency > 2s"
+
+      - alert: InstanceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          description: "Service down"
