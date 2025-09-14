@@ -1,0 +1,167 @@
+name: App CI/CD
+
+# Run on PRs and merges to branches
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+
+permissions:
+  contents: read
+  packages: write      # needed to push to GitHub Container Registry (GHCR)
+  id-token: write      # required for OIDC (cosign keyless signing and AWS OIDC)
+  actions: read
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/${{ github.repository }}-backend
+  IMAGE_TAG: ${{ github.sha }}
+  K8S_NAMESPACE: app
+  DEPLOYMENT_NAME: backend
+  KUBE_CONTEXT: ${{ github.event.inputs.kube_context || 'dev' }}
+
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.set-image.outputs.image }}
+      image-ref: ${{ steps.set-image.outputs.image_ref }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (for multi-arch builds if needed)
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Set IMAGE ref
+        id: set-image
+        run: |
+          echo "image=${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" >> $GITHUB_OUTPUT
+          echo "image_ref=${{ env.IMAGE_NAME }}:latest" >> $GITHUB_OUTPUT
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('backend/requirements.txt') }}
+
+      - name: Build backend image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend
+          push: false
+          tags: |
+            ${{ steps.set-image.outputs.image }}
+            ${{ steps.set-image.outputs.image_ref }}
+
+      - name: Run Trivy scan (convenient SCA + vuln)
+        uses: aquasecurity/trivy-action@v2
+        with:
+          image-ref: ${{ steps.set-image.outputs.image }}
+          format: 'table'
+          exit-code: '1'        # fail if high/critical found
+          severity: 'CRITICAL,HIGH'
+
+      - name: Run Grype scan (complementary vulnerability scanner)
+        uses: anchore/grype-action@v1
+        with:
+          image: ${{ steps.set-image.outputs.image }}
+          fail-on: 'vuln'       # fail on any vulns (adjust policy)
+
+      - name: Authenticate to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image to GHCR
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ steps.set-image.outputs.image }}
+            ${{ steps.set-image.outputs.image_ref }}
+
+      - name: Keyless sign image with cosign via OIDC
+        # Uses sigstore/cosign keyless signing with GitHub OIDC.
+        run: |
+          curl -sSL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+          chmod +x /usr/local/bin/cosign
+          # keyless sign - requires id-token permission above
+          cosign sign --yes ${{ steps.set-image.outputs.image }}
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+
+      - name: Verify image signature
+        run: |
+          cosign verify ${{ steps.set-image.outputs.image }}
+
+  deploy-to-k8s:
+    needs: build-and-scan
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+      url: https://your-k8s-dashboard.example   # optional
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (if using EKS) via OIDC
+        if: ${{ secrets.AWS_ROLE_TO_ASSUME != '' }}
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: '1.27.0'
+
+      - name: install helm
+        uses: azure/setup-helm@v3
+
+      - name: Get kubeconfig (EKS)
+        if: ${{ secrets.AWS_ROLE_TO_ASSUME != '' }}
+        run: |
+          aws eks update-kubeconfig --name ${K8S_CLUSTER_NAME:-$K8S_CLUSTER} --region ${{ secrets.AWS_REGION }}
+
+      - name: Verify cosign signature before deploy
+        run: |
+          cosign verify ${{ needs.build-and-scan.outputs.image }} || (echo "Cosign verification failed" && exit 1)
+
+      - name: Deploy to Kubernetes with kubectl/helm
+        env:
+          IMAGE: ${{ needs.build-and-scan.outputs.image }}
+        run: |
+          # Option A: Helm upgrade (if you use Helm)
+          if [ -d "./helm-chart" ]; then
+            helm upgrade --install ${DEPLOYMENT_NAME} ./helm-chart \
+              --namespace ${K8S_NAMESPACE} \
+              --set backend.image=${IMAGE}
+          else
+            # Option B: patch deployment image
+            kubectl -n ${K8S_NAMESPACE} set image deployment/${DEPLOYMENT_NAME} ${DEPLOYMENT_NAME}=${IMAGE} --record
+            kubectl -n ${K8S_NAMESPACE} rollout status deployment/${DEPLOYMENT_NAME} --timeout=120s
+          fi
+
+      - name: Wait for rollout and run smoke tests
+        run: |
+          ./ci/scripts/smoke_test.sh http://backend.${K8S_NAMESPACE}.svc.cluster.local:8000 || exit 1
+
+      - name: Post-deploy security checks
+        run: |
+          ./ci/scripts/run_security_checks.sh || true
+
+      - name: Annotate run with image and signature
+        run: |
+          gh run edit ${{ github.run_id }} --add-matrix "image=${{ needs.build-and-scan.outputs.image }}"
