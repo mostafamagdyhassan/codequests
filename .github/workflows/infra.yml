@@ -1,0 +1,128 @@
+name: Infra CI/CD
+
+on:
+  push:
+    paths:
+      - 'terraform/**'
+    branches:
+      - main
+      - prod
+  workflow_dispatch:
+
+permissions:
+  id-token: write       # to assume AWS role via OIDC
+  contents: read
+
+env:
+  TF_WORKING_DIR: terraform/prod
+  TF_STATE_BUCKET: my-terraform-state-bucket  # set in secrets or variables
+
+jobs:
+  fmt-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.6.0
+
+      - name: Terraform fmt
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform fmt -check
+
+      - name: Terraform validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -input=false && terraform validate
+
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: fmt-validate
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tfsec
+        run: |
+          curl -sSL https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+
+      - name: Run tfsec
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: tfsec .
+
+      - name: Install checkov
+        run: |
+          pip install checkov
+
+      - name: Run checkov
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: checkov -d .
+
+  plan:
+    runs-on: ubuntu-latest
+    needs: security-scan
+    outputs:
+      tfplan-file: ${{ steps.plan.outputs.tfplan }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_OIDC_ROLE }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.6.0
+
+      - name: Terraform Init (backend + providers)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -input=false
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan -out=tfplan.binary -input=false
+          terraform show -json tfplan.binary > tfplan.json
+          echo "::set-output name=tfplan::$(base64 -w0 tfplan.binary)"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.TF_WORKING_DIR }}/tfplan.binary
+
+  apply-prod:
+    runs-on: ubuntu-latest
+    needs: plan
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    environment: production
+    steps:
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: ./tfplan
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_OIDC_ROLE }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Prompt for manual approval
+        uses: hmarr/auto-approve-action@v2
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Terraform Apply (prod)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform apply -input=false ./tfplan/tfplan.binary
