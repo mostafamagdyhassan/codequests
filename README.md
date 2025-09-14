@@ -1183,4 +1183,144 @@ For Prometheus, Grafana, Loki, Jaeger in production use their official Helm char
 
 Adjust resource requests/limits and replica counts before deploying to production.
 
-If your cluster blocks hostPath mounts (promtail), adjust to use a DaemonSet with a Fluent Bit or a cluster logging solution.
+If your cluster blocks hostPath mounts (promtail), adjust to use a DaemonSet with a Fluent Bit or a cluster logging solution.4
+
+
+
+
+
+
+
+
+
+Notes (app pipeline)
+
+Scanners: Trivy (Aqua) + Grype provide overlapping coverage (OS packages + language deps). Trivy is quick, Grype offers a different database mapping — running both increases detection probability.
+
+Image signing: cosign keyless signing uses GitHub OIDC so no private cosign keys in repo. The id-token: write permission is required in workflow. COSIGN_EXPERIMENTAL=1 may be required for some OIDC features.
+
+Image registry: GHCR (GitHub Container Registry) used here — it integrates with GitHub and works with GITHUB_TOKEN for auth.
+
+Kubernetes deployment: supports Helm or plain kubectl set image. The workflow verifies the cosign signature before applying the image.
+
+Secrets: AWS role is obtained via OIDC (see infra pipeline); you must set secrets.AWS_ROLE_TO_ASSUME and secrets.AWS_REGION if deploying to EKS. For non-AWS, provide KUBE_CONFIG_DATA (base64 kubeconfig) as a secret and use it.
+
+
+Uses GitHub OIDC + aws-actions/configure-aws-credentials to assume an AWS role. This avoids long-lived AWS keys in GitHub Secrets — recommended.
+
+Runs tfsec and Checkov for infrastructure-as-code security scanning.
+
+Requires manual approval step before applying to production (controlled via job conditions or environment protection rules). You can also add the environment with required reviewers in GitHub repo settings to enforce manual approvals.
+
+Terraform remote state should be set in terraform/prod/backend.tf (S3 + DynamoDB) — configure TF_VAR_* via repo secrets.
+
+
+
+Security & DevSecOps features implemented
+
+No long-lived cloud credentials in repo — use GitHub OIDC to assume AWS roles.
+
+Image vulnerability scanning — Trivy + Grype in pipeline (failing build on high/critical).
+
+Terraform IaC scanning — tfsec + Checkov.
+
+Image signing & provenance — cosign keyless signing with OIDC; verify signature before deploy.
+
+Secrets management — keep secrets in GitHub Secrets for CI; runtime secrets stored in cloud provider or Vault (recommended). Optionally use external-secrets in cluster to retrieve from AWS Secrets Manager.
+
+RBAC — deployments use ServiceAccounts and namespace isolation; pipeline can run RBAC checks (via kubectl auth can-i).
+
+Artifact registry — GHCR, with images signed and provenance recorded in workflow metadata.
+
+Policy enforcement — require tfsec/checkov to pass before plan; enforce manual approval for prod apply; require metadata in artifacts; require cosign verification before deploy.
+
+Supply-chain provenance — cosign signatures + attestation can be extended (e.g., rekor, in-toto).
+
+6) Tool choices & short justification (comparison)
+Container vulnerability scanning
+
+Trivy (chosen) — fast, simple, good coverage for OS packages & language deps, built-in CI action.
+
+Grype (also used) — different DB/matching; complementary.
+
+Snyk — strong prioritization + fix advice but is commercial; good for enterprise.
+
+Why Trivy + Grype: fast open-source, low friction, good coverage; running both increases detection recall.
+
+Image signing
+
+cosign (chosen) — easy keyless signing using OIDC (no keys stored in repo), integrates with Sigstore/Rekor for transparency.
+
+Alternatives: Notary (v2), GPG — more setup & key handling.
+
+Why cosign: modern, OIDC-friendly, CI-friendly, integrates well with GitHub Actions.
+
+Terraform scanning (IaC)
+
+tfsec (chosen) — fast, targeted to TF, active ruleset.
+
+checkov (also used) — broad coverage across IaC types and policies.
+
+Why both: tfsec is TF-focused, checkov does deeper static checks and CI integration; using both improves safety.
+
+Secrets management
+
+GitHub Secrets for CI-life secrets; AWS Secrets Manager or HashiCorp Vault for runtime secrets.
+
+Use Kubernetes External Secrets (external-secrets) to sync secrets with least privilege (IRSA).
+
+Why: GitHub Secrets are convenient for CI; Vault/Secrets Manager required for production secret lifecycle & audit.
+
+Kubernetes deployment method
+
+Helm preferred for templating & upgrades; kubectl for simple patches.
+
+Use Helm charts (in repo or public) and add helm test for post-install checks.
+
+Why: Helm handles templating, values, lifecycle better for complex stacks.
+
+Cloud auth
+
+GitHub OIDC (chosen) to assume AWS IAM roles — no AWS keys in repo.
+
+Alternative: IAM user creds in GitHub secrets (less secure).
+
+Why: OIDC removes long-lived credentials, fits GitHub Actions natively.
+
+7) How to enable the minimal set of infra pieces (quick checklist)
+
+Create GitHub OIDC role in AWS:
+
+Create IAM role with trust policy allowing token.actions.githubusercontent.com for your repo or org.
+
+Attach least-privilege policies (Terraform apply needs: EC2, IAM, EKS, S3 for remote state, etc.).
+
+Set GitHub repo secrets:
+
+AWS_GITHUB_OIDC_ROLE = ARN of IAM role
+
+AWS_REGION = region
+
+Optionally KUBE_CONFIG_DATA (base64) if not using EKS + OIDC
+
+Enable Actions permissions:
+
+Under repo settings -> Actions: Allow id-token and ensure Read & write for packages if pushing to GHCR.
+
+Add branch protection / environment protection:
+
+Require manual reviewers for the production environment.
+
+Install cosign into runner — workflow does it automatically.
+
+8) Final notes & next steps I can deliver
+
+I can also:
+
+Produce the exact IAM trust policy (JSON) to configure the AWS role for GitHub OIDC.
+
+Provide Helm values and kubectl manifests that the workflows will use (so helm upgrade --install runs smoothly).
+
+Create a GitHub Actions reusable workflow to share common steps across repos.
+
+Add SLSA attestation step (e.g., GitHub slsa-verifier + cosign attestations).
