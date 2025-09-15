@@ -312,6 +312,10 @@ behavior differs under load.
 
 Cost & access: Local is free and great for dev/test; EKS offers production-grade HA, cloud native 
 
+or production, in terraform/prod/:
+
+Replace modules/vpc and modules/eks with the official modules:
+
 integrations.
 
 
